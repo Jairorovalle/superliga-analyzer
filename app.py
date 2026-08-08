@@ -74,12 +74,16 @@ def normalize(df):
         if "PTS" in df.columns:
             df["Pts/PJ"] = pd.to_numeric(numeric(df["PTS"]) / pj_values, errors="coerce").round(2)
 
-    sort_cols = [c for c in ["PTS", "DG", "GF"] if c in df.columns]
+    def normalize(df):
+    ...
+    sort_cols = ...
+    
     if sort_cols:
-        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
-
-    if "Pos" in df.columns:
-    df["Pos"] = range(1, len(df) + 1)
+        df = ...
+    
+    df.insert(...)
+    
+    return df
 else:
     df.insert(0, "Pos", range(1, len(df) + 1))
 
