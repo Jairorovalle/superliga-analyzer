@@ -78,8 +78,10 @@ def normalize(df):
     if sort_cols:
         df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
 
+    if "Pos" in df.columns:
+    df["Pos"] = range(1, len(df) + 1)
+else:
     df.insert(0, "Pos", range(1, len(df) + 1))
-    return df
 
 
 if st.button("🔄 Actualizar datos de FutbolGol", type="primary"):
