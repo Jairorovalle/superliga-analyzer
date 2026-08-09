@@ -1,6 +1,7 @@
 import re
 from io import StringIO
 from urllib.parse import urljoin, urlparse
+from html.parser import HTMLParser
 
 import pandas as pd
 import requests
