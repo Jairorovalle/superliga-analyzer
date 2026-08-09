@@ -1,226 +1,285 @@
 import re
-import time
-import requests
-import pandas as pd
-import streamlit as st
-from bs4 import BeautifulSoup
+from io import StringIO
 from urllib.parse import urljoin, urlparse
 
-BASE = "https://www.futbolgol.com"
-HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1"}
-session = requests.Session()
-session.headers.update(HEADERS)
+import pandas as pd
+import requests
+import streamlit as st
 
-TEAM_SLUGS = [
-    "anglo-americano","anglo-colombiano","colombo-britanico","frances-azul",
-    "gimnasio-el-hontanar","la-montana","liceo-de-colombia-verde","montessori",
-    "nes-fc","nueva-granada","pureza-de-maria","rochester","san-viator",
-    "san-bartolo-1941","vermont-a"
-]
-
-def soup(url):
-    r = session.get(url, timeout=25)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "lxml")
-
-def clean(x):
-    return re.sub(r"\s+", " ", x or "").strip()
-
-def team_name(url):
-    try:
-        s = soup(url)
-        h = s.find("h1")
-        if h: return clean(h.get_text(" ", strip=True))
-        t = s.find("title")
-        if t: return clean(t.get_text(" ", strip=True)).replace(" - FutbolGol", "")
-    except Exception:
-        pass
-    return url.rstrip("/").split("/")[-1].replace("-", " ").title()
-
-def candidate_player_url(url, base):
-    u = urljoin(base, url).rstrip("/") + "/"
-    p = urlparse(u).path.lower()
-    if "futbolgol.com" not in u or "/equipo/" in p:
-        return None
-    if any(x in p for x in ["/superliga/", "/torneo/", "/contact"]):
-        return None
-    return u
-
-def player_links(team_url):
-    s = soup(team_url)
-    links = []
-
-    # Primero busca enlaces claramente asociados a jugadores.
-    for a in s.find_all("a", href=True):
-        u = candidate_player_url(a["href"], team_url)
-        if not u: continue
-        txt = clean(a.get_text(" ", strip=True)).lower()
-        if ("/jugador/" in u.lower() or "/player/" in u.lower()
-            or "/futbolista/" in u.lower()
-            or any(k in txt for k in ["jugador", "perfil", "plantilla"])):
-            if u not in links: links.append(u)
-
-    # Segundo intento: tarjetas de jugadores con foto/nombre.
-    if not links:
-        for a in s.find_all("a", href=True):
-            u = candidate_player_url(a["href"], team_url)
-            if not u: continue
-            img = a.find("img")
-            txt = clean(a.get_text(" ", strip=True))
-            alt = clean(img.get("alt", "")) if img else ""
-            if len((txt + " " + alt).split()) >= 2 and u not in links:
-                links.append(u)
-
-    return links
-
-def age_from_text(text):
-    text = clean(text)
-
-    # Caso comprobado en FutbolGol: "Edad 43"
-    for pattern in [
-        r"\bEdad\b\s*:?\s*(\d{1,2})\b",
-        r'"(?:edad|age)"\s*:\s*(\d{1,2})'
-    ]:
-        m = re.search(pattern, text, re.I)
-        if m:
-            age = int(m.group(1))
-            if 15 <= age <= 80:
-                return age
-
-    # Fallback: "Cumpleaños 4 agosto, 1983"
-    months = {
-        "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
-        "julio":7,"agosto":8,"septiembre":9,"octubre":10,"noviembre":11,
-        "diciembre":12
-    }
-    m = re.search(
-        r"(?:Cumpleaños|Fecha de nacimiento|Nacimiento)\s*:?\s*"
-        r"(\d{1,2})\s+([A-Za-zÁÉÍÓÚÑáéíóúñ]+)[,\s]+(\d{4})", text, re.I
-    )
-    if m and m.group(2).lower() in months:
-        day, month, year = int(m.group(1)), months[m.group(2).lower()], int(m.group(3))
-        now = time.localtime()
-        age = now.tm_year - year - ((now.tm_mon, now.tm_mday) < (month, day))
-        if 15 <= age <= 80:
-            return age
-    return None
-
-def parse_player(url, team):
-    try:
-        s = soup(url)
-    except Exception:
-        return None
-
-    text = clean(s.get_text(" ", strip=True))
-    age = age_from_text(text)
-
-    # Evita tratar páginas de navegación como jugadores.
-    if age is None and not re.search(r"\b(?:Nombre|Posición|Cumpleaños|Edad)\b", text, re.I):
-        return None
-
-    h1 = s.find("h1")
-    name = clean(h1.get_text(" ", strip=True)) if h1 else url.rstrip("/").split("/")[-1].replace("-", " ").title()
-    return {"Equipo": team, "Jugador": name, "Edad": age, "URL jugador": url}
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def scan():
-    rows, diag = [], []
-
-    for slug in TEAM_SLUGS:
-        team_url = f"{BASE}/equipo/{slug}/"
-        try:
-            team = team_name(team_url)
-            links = player_links(team_url)
-            valid = ages = 0
-
-            for url in links:
-                rec = parse_player(url, team)
-                if rec:
-                    valid += 1
-                    ages += int(rec["Edad"] is not None)
-                    rows.append(rec)
-
-            diag.append({
-                "Equipo": team,
-                "Enlaces jugadores": len(links),
-                "Fichas válidas": valid,
-                "Con edad": ages,
-                "URL equipo": team_url
-            })
-        except Exception as e:
-            diag.append({
-                "Equipo": slug, "Enlaces jugadores": 0,
-                "Fichas válidas": 0, "Con edad": 0,
-                "URL equipo": team_url, "Error": str(e)
-            })
-
-    players = pd.DataFrame(rows)
-    if not players.empty:
-        players = players.drop_duplicates(["Equipo", "Jugador", "URL jugador"])
-    return players, pd.DataFrame(diag)
-
-def team_stats(players):
-    if players.empty:
-        return pd.DataFrame()
-
-    x = players.dropna(subset=["Edad"]).copy()
-    if x.empty:
-        return pd.DataFrame()
-
-    out = x.groupby("Equipo").agg(
-        Jugadores=("Edad", "count"),
-        Edad_promedio=("Edad", "mean"),
-        Edad_mediana=("Edad", "median"),
-        Mas_joven=("Edad", "min"),
-        Mas_veterano=("Edad", "max")
-    ).reset_index()
-
-    out[["Edad_promedio", "Edad_mediana"]] = out[["Edad_promedio", "Edad_mediana"]].round(1)
-    return out.sort_values(["Edad_promedio", "Equipo"]).reset_index(drop=True)
+BASE_URL = "https://www.futbolgol.com/superliga/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                  "Mobile/15E148 Safari/604.1"
+}
 
 st.set_page_config(page_title="Superliga Analyzer", page_icon="⚽", layout="wide")
 st.title("⚽ Superliga Analyzer")
-st.caption("Análisis de galerías y edades de FutbolGol")
+st.caption("Clasificación + análisis de galerías de jugadores")
 
-if st.button("🔄 Actualizar datos de FutbolGol", type="primary"):
-    st.cache_data.clear()
-    st.rerun()
+TEAM_RE = re.compile(r"/equipo/([^/?#]+)/?", re.I)
+PLAYER_RE = re.compile(r"/(?:jugador|player|jugadores|players)/([^/?#]+)/?", re.I)
+AGE_RE = re.compile(r"(?i)(?:edad|age)\s*[:\-]?\s*(\d{1,2})\b")
 
-players, diagnostic = scan()
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.links = []
+        self.href = None
+        self.anchor = []
 
-tab1, tab2, tab3 = st.tabs(["📊 Edad por equipo", "👥 Jugadores", "🔎 Diagnóstico"])
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "a":
+            self.href = dict(attrs).get("href")
+            self.anchor = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+        if self.href is not None:
+            self.anchor.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self.href is not None:
+            self.links.append((self.href, " ".join(self.anchor).strip()))
+            self.href = None
+            self.anchor = []
+
+def get(url, timeout=30):
+    r = requests.get(url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.text, r.headers.get("content-type", "")
+
+def html_text(html):
+    p = TextExtractor()
+    p.feed(html)
+    return re.sub(r"\s+", " ", " ".join(p.parts)).strip()
+
+def page_links(html, page_url):
+    p = TextExtractor()
+    p.feed(html)
+    return [(urljoin(page_url, h), t) for h, t in p.links if h]
+
+def clean_table(df):
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            " ".join(str(x) for x in c if str(x) != "nan").strip()
+            for c in df.columns
+        ]
+    df.columns = [re.sub(r"\s+", " ", str(c)).strip() for c in df.columns]
+    return df.dropna(how="all").reset_index(drop=True)
+
+def get_standings():
+    html, _ = get(BASE_URL)
+    tables = pd.read_html(StringIO(html))
+    best, score_best = None, -1
+    for t in tables:
+        t = clean_table(t)
+        cols = " ".join(str(c).lower() for c in t.columns)
+        score = sum(x in cols for x in ["equipo","pj","pg","pe","pp","gf","gc","pts"])
+        if score > score_best:
+            best, score_best = t, score
+    if best is None:
+        raise RuntimeError("No se encontró la tabla de posiciones.")
+    return best
+
+def team_links_from_superliga():
+    html, _ = get(BASE_URL)
+    found = {}
+    for href, _ in page_links(html, BASE_URL):
+        m = TEAM_RE.search(urlparse(href).path)
+        if m:
+            slug = m.group(1).lower()
+            found[slug] = href.rstrip("/") + "/"
+    return found
+
+def find_player_links(team_url, team_html):
+    found = {}
+    for href, anchor in page_links(team_html, team_url):
+        if PLAYER_RE.search(urlparse(href).path):
+            found[href.rstrip("/") + "/"] = anchor.strip()
+    # Also catch absolute links embedded in HTML/script blocks.
+    for href in re.findall(r'https?://[^"\'\s<>]+futbolgol\.com[^"\'\s<>]+', team_html, re.I):
+        if PLAYER_RE.search(urlparse(href).path):
+            found[href.rstrip("/") + "/"] = found.get(href.rstrip("/") + "/", "")
+    return found
+
+def extract_player_record(player_url, fallback_name=""):
+    html, _ = get(player_url, timeout=25)
+    text = html_text(html)
+
+    age = None
+    m = AGE_RE.search(text)
+    if m:
+        n = int(m.group(1))
+        if 15 <= n <= 80:
+            age = n
+
+    if age is None:
+        for pat in [
+            r'(?i)["\'](?:edad|age)["\']\s*[:=]\s*["\']?(\d{1,2})',
+            r'(?i)\b(?:edad|age)\b[^0-9]{0,40}(\d{1,2})\b',
+        ]:
+            m = re.search(pat, html)
+            if m:
+                n = int(m.group(1))
+                if 15 <= n <= 80:
+                    age = n
+                    break
+
+    name = fallback_name.strip()
+    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.I | re.S)
+    if h1:
+        candidate = re.sub(r"<[^>]+>", " ", h1.group(1))
+        candidate = re.sub(r"\s+", " ", candidate).strip()
+        if 2 <= len(candidate) <= 100:
+            name = candidate
+
+    if not name:
+        title = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        if title:
+            name = re.sub(r"<[^>]+>", " ", title.group(1))
+            name = re.sub(r"\s*[-|]\s*FutbolGol.*$", "", name, flags=re.I).strip()
+
+    return {
+        "Jugador": name or player_url.rstrip("/").split("/")[-1].replace("-", " ").title(),
+        "Edad": age,
+        "URL jugador": player_url,
+    }
+
+def analyze_team(slug, team_url):
+    team_html, _ = get(team_url)
+    player_links = find_player_links(team_url, team_html)
+    records, errors = [], 0
+
+    for player_url, anchor in player_links.items():
+        try:
+            rec = extract_player_record(player_url, anchor)
+            if rec["Edad"] is not None:
+                records.append(rec)
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+
+    return records, len(player_links), errors
+
+
+# ---------------- UI ----------------
+tab1, tab2 = st.tabs(["📊 Clasificación", "👥 Galería de jugadores"])
 
 with tab1:
-    s = team_stats(players)
-    if s.empty:
-        st.error("Todavía no se recuperaron edades de las fichas individuales.")
-        st.info("Revisa Diagnóstico.")
+    st.subheader("📊 Clasificación")
+    if st.button("🔄 Actualizar clasificación", type="primary"):
+        try:
+            st.session_state["standings"] = get_standings()
+        except Exception as e:
+            st.error(f"No fue posible leer la clasificación: {e}")
+    if "standings" in st.session_state:
+        st.dataframe(st.session_state["standings"], use_container_width=True, hide_index=True)
     else:
-        st.success(f"Se recuperaron {len(players)} fichas de jugadores.")
-        st.dataframe(s, use_container_width=True, hide_index=True)
-
-        nes = s[s["Equipo"].str.contains("NES", case=False, na=False)]
-        if not nes.empty:
-            st.subheader("🟢 NES FC")
-            st.dataframe(nes, use_container_width=True, hide_index=True)
+        st.info("Pulsa «Actualizar clasificación» para consultar FutbolGol.")
 
 with tab2:
-    if players.empty:
-        st.warning("No se encontraron fichas individuales.")
-    else:
-        selected = st.selectbox("Equipo", ["Todos"] + sorted(players["Equipo"].unique()))
-        view = players if selected == "Todos" else players[players["Equipo"] == selected]
+    st.subheader("👥 Análisis de galerías")
+    st.write(
+        "La app ahora entra en las fichas individuales de los jugadores. "
+        "FutbolGol muestra allí la edad, aunque no esté en el HTML inicial de la página del equipo."
+    )
+
+    if st.button("🚀 Analizar galerías de todos los equipos", type="primary"):
+        try:
+            teams = team_links_from_superliga()
+            st.info(f"Se identificaron {len(teams)} páginas de equipos. Ahora se revisarán sus jugadores.")
+            all_rows, diagnostics = [], []
+            progress = st.progress(0)
+
+            for i, (slug, url) in enumerate(teams.items(), start=1):
+                team_name = slug.replace("-", " ").title()
+                try:
+                    records, player_links, errors = analyze_team(slug, url)
+                    diagnostics.append({
+                        "Equipo": team_name,
+                        "Jugadores encontrados": player_links,
+                        "Jugadores con edad": len(records),
+                        "Sin edad / error": errors,
+                        "URL": url,
+                    })
+                    for rec in records:
+                        all_rows.append({"Equipo": team_name, **rec})
+                except Exception as e:
+                    diagnostics.append({
+                        "Equipo": team_name,
+                        "Jugadores encontrados": 0,
+                        "Jugadores con edad": 0,
+                        "Sin edad / error": 0,
+                        "URL": url,
+                        "Error": str(e),
+                    })
+                progress.progress(i / max(len(teams), 1))
+
+            st.session_state["players"] = pd.DataFrame(all_rows)
+            st.session_state["diagnostics"] = pd.DataFrame(diagnostics)
+        except Exception as e:
+            st.error(f"No fue posible iniciar el análisis: {e}")
+
+    players = st.session_state.get("players", pd.DataFrame())
+    diagnostics = st.session_state.get("diagnostics", pd.DataFrame())
+
+    if not diagnostics.empty:
+        st.subheader("🔎 Diagnóstico por equipo")
         st.dataframe(
-            view, use_container_width=True, hide_index=True,
-            column_config={"URL jugador": st.column_config.LinkColumn("Ficha FutbolGol")}
-        )
-        st.download_button(
-            "⬇️ Descargar jugadores CSV",
-            view.to_csv(index=False).encode("utf-8-sig"),
-            "superliga_jugadores.csv", "text/csv"
+            diagnostics,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"URL": st.column_config.LinkColumn("URL")},
         )
 
-with tab3:
-    st.dataframe(diagnostic, use_container_width=True, hide_index=True)
-    st.metric("Jugadores con edad", int(diagnostic["Con edad"].sum()))
-    st.info("La extracción entra a la ficha individual y busca primero el campo Edad; si no aparece, calcula la edad desde Cumpleaños.")
+    if not players.empty:
+        st.success(f"Se recuperaron {len(players)} jugadores con edad.")
+        st.subheader("🏆 Comparación de edades por equipo")
+
+        summary = (
+            players.groupby("Equipo")
+            .agg(
+                Jugadores=("Jugador", "count"),
+                Edad_promedio=("Edad", "mean"),
+                Edad_min=("Edad", "min"),
+                Edad_max=("Edad", "max"),
+            )
+            .reset_index()
+            .sort_values("Edad_promedio")
+        )
+        summary["Edad_promedio"] = summary["Edad_promedio"].round(1)
+
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        if len(summary):
+            youngest = summary.iloc[0]
+            oldest = summary.iloc[-1]
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("👶 Equipo más joven", f"{youngest['Equipo']} — {youngest['Edad_promedio']:.1f} años")
+            with c2:
+                st.metric("👴 Equipo más veterano", f"{oldest['Equipo']} — {oldest['Edad_promedio']:.1f} años")
+
+        st.subheader("👤 Jugadores")
+        st.dataframe(
+            players.sort_values(["Equipo", "Edad", "Jugador"]),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"URL jugador": st.column_config.LinkColumn("Ficha del jugador")},
+        )
+
+        st.download_button(
+            "⬇️ Descargar jugadores y edades (CSV)",
+            players.to_csv(index=False).encode("utf-8-sig"),
+            "superliga_jugadores_edades.csv",
+            "text/csv",
+        )
+    elif not diagnostics.empty:
+        st.warning(
+            "Se encontraron páginas de equipos, pero no jugadores con edad. "
+            "Revisa «Jugadores encontrados» para ver si FutbolGol está exponiendo las fichas."
+        )
